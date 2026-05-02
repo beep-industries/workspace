@@ -26,13 +26,13 @@ resource "docker_image" "communities_migrations" {
   # Rebuild uniquement si le ref git change.
   # Note: on ne peut pas utiliser filesha1() sur local.repo_path ici car
   # le répertoire n'existe pas encore au moment du plan Terraform.
-  # → Le null_resource.prepare_infra_files garantit que le repo est là à l'apply.
+  # → Le null_resource.populate_config_volumes garantit que le repo est là à l'apply.
   triggers = {
     git_ref = local.communities_git_ref
   }
 
   keep_locally = false
-  depends_on   = [null_resource.prepare_infra_files]
+  depends_on   = [null_resource.populate_config_volumes]
 }
 
 resource "docker_container" "communities_migrations" {
@@ -74,7 +74,7 @@ resource "docker_image" "communities" {
   }
 
   keep_locally = false
-  depends_on   = [null_resource.prepare_infra_files]
+  depends_on   = [null_resource.populate_config_volumes]
 }
 
 # ─── Container du service Communities ─────────────────────────────────────────
