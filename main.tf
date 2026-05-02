@@ -1,23 +1,12 @@
-terraform {
-  required_providers {
-    coder = {
-      source = "coder/coder"
-    }
-    docker = {
-      source = "kreuzwerker/docker"
-    }
-  }
-}
-
 # ─── Data Sources ──────────────────────────────────────────────────────────────
 
-data "coder_provisioner"     "me" {}
-data "coder_workspace"       "me" {}
+data "coder_provisioner" "me" {}
+data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 
 # ─── Providers ─────────────────────────────────────────────────────────────────
 
-provider "coder"  {}
+provider "coder" {}
 provider "docker" {}
 
 # ─── Locals ────────────────────────────────────────────────────────────────────
@@ -45,11 +34,10 @@ locals {
     : data.coder_parameter.communities_ref.value
   )
 
-  # Chemin de clone sur le host Coder.
-  # Utilisé comme build context pour les images Docker et comme bind mount
-  # pour les fichiers de config (keycloak-config, init-uuid.sql, etc.)
-  # Note: /tmp peut être vidé par l'OS. Le null_resource.prepare_infra_files
-  # s'assure de re-cloner si besoin à chaque apply (always_run = timestamp()).
+  # Chemin de clone temporaire sur le host Coder.
+  # Utilisé uniquement pour le build des images Docker et pour peupler les
+  # volumes de config (populate_config_volumes copie les fichiers dans des
+  # volumes Docker persistants — pas de dépendance au contenu de /tmp au runtime).
   repo_path = "/tmp/beep-workspace-${local.workspace_id}/communities"
 }
 
@@ -69,6 +57,11 @@ resource "coder_agent" "main" {
       --auth none --port 13337 \
       >/tmp/code-server.log 2>&1 &
 
+    # ── Extensions VS Code ────────────────────────────────────────────────────
+    for ext in rust-lang.rust-analyzer serayuzgur.crates tamasfe.even-better-toml usernamehw.errorlens; do
+      /tmp/code-server/bin/code-server --install-extension "$ext" --force 2>/dev/null || true
+    done
+
     # ── Rust toolchain ────────────────────────────────────────────────────────
     if ! command -v rustup &>/dev/null; then
       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -76,42 +69,78 @@ resource "coder_agent" "main" {
     fi
     source "$HOME/.cargo/env"
 
-    # ── sqlx-cli (pour lancer les migrations manuellement) ────────────────────
+    # ── sqlx-cli ──────────────────────────────────────────────────────────────
     if ! command -v sqlx &>/dev/null; then
       cargo install sqlx-cli --no-default-features --features postgres
     fi
 
-    # ── Clone du repo si mode local (dev dans VS Code) ────────────────────────
+    # ── sccache (cache compilateur Rust partagé entre builds) ─────────────────
+    if ! command -v sccache &>/dev/null; then
+      cargo install sccache --locked
+    fi
+    grep -q RUSTC_WRAPPER "$HOME/.cargo/env" 2>/dev/null \
+      || echo 'export RUSTC_WRAPPER=sccache' >> "$HOME/.cargo/env"
+
+    # ── Clone du repo (dev dans VS Code) ─────────────────────────────────────
     if [ ! -d "$HOME/communities" ]; then
       git clone --branch "${local.communities_git_ref}" \
         https://github.com/beep-industries/communities.git \
         "$HOME/communities"
     fi
 
-    # ── Redirection de ports vers les services Docker ─────────────────────────
-    # Le Coder agent proxy les URL http://localhost:PORT depuis ce container.
-    # socat redirige ces ports vers les hostnames Docker sur le réseau partagé.
-    if ! command -v socat &>/dev/null; then
-      sudo apt-get install -y socat -qq
-    fi
+    # ── Settings rust-analyzer ────────────────────────────────────────────────
+    mkdir -p "$HOME/communities/.vscode"
+    cat > "$HOME/communities/.vscode/settings.json" << 'EOF_VSCODE'
+{
+  "rust-analyzer.check.command": "clippy",
+  "editor.formatOnSave": true,
+  "[rust]": { "editor.defaultFormatter": "rust-lang.rust-analyzer" }
+}
+EOF_VSCODE
 
-    # Infra toujours disponible
+    # ── Makefile ──────────────────────────────────────────────────────────────
+    cat > "$HOME/Makefile" << 'EOF_MAKEFILE'
+run:
+	cargo run --bin api
+
+test:
+	cargo test
+
+migrate:
+	sqlx migrate run --source core/migrations
+
+migrate-revert:
+	sqlx migrate revert --source core/migrations
+
+psql:
+	psql $DATABASE_URL
+
+logs:
+	docker logs -f ${local.prefix}-communities
+
+logs-db:
+	docker logs -f ${local.prefix}-communities-db
+
+watch:
+	cargo watch -x 'run --bin api'
+EOF_MAKEFILE
+
+    # ── Redirection de ports vers les services Docker ─────────────────────────
     socat TCP-LISTEN:8080,fork,reuseaddr TCP:keycloak:8080   >/dev/null 2>&1 &
     socat TCP-LISTEN:15672,fork,reuseaddr TCP:rabbitmq:15672 >/dev/null 2>&1 &
     socat TCP-LISTEN:5432,fork,reuseaddr TCP:communities-db:5432 >/dev/null 2>&1 &
 
-    # Communities API uniquement si le service est géré (pas local)
     COMMUNITIES_MODE="${local.communities_mode}"
     if [ "$COMMUNITIES_MODE" != "local" ]; then
       socat TCP-LISTEN:3003,fork,reuseaddr TCP:communities:3003 >/dev/null 2>&1 &
       socat TCP-LISTEN:9090,fork,reuseaddr TCP:communities:9090 >/dev/null 2>&1 &
     fi
 
-    echo "✅ Workspace Beep prêt"
-    echo "   → communities cloné dans ~/communities"
-    echo "   → DB:       postgres://communities:communities@localhost:5432/communities"
-    echo "   → Keycloak: http://localhost:8080/admin  (admin/admin)"
-    echo "   → RabbitMQ: http://localhost:15672        (guest/guest)"
+    echo "Workspace Beep pret"
+    echo "   -> DB:       postgres://communities:communities@localhost:5432/communities"
+    echo "   -> Keycloak: http://localhost:8080/admin  (admin/admin)"
+    echo "   -> RabbitMQ: http://localhost:15672        (guest/guest)"
+    echo "   -> make help pour voir les commandes disponibles"
   EOT
 
   # Variables d'environnement injectées dans le shell du développeur.
@@ -162,6 +191,38 @@ resource "coder_agent" "main" {
     script       = "coder stat mem"
     interval     = 10
     timeout      = 1
+  }
+
+  metadata {
+    display_name = "DB Communities"
+    key          = "2_svc_communities_db"
+    script       = "docker inspect --format='{{.State.Health.Status}}' ${local.prefix}-communities-db 2>/dev/null || echo stopped"
+    interval     = 15
+    timeout      = 5
+  }
+
+  metadata {
+    display_name = "Keycloak"
+    key          = "3_svc_keycloak"
+    script       = "docker inspect --format='{{.State.Health.Status}}' ${local.prefix}-keycloak 2>/dev/null || echo stopped"
+    interval     = 15
+    timeout      = 5
+  }
+
+  metadata {
+    display_name = "RabbitMQ"
+    key          = "4_svc_rabbitmq"
+    script       = "docker inspect --format='{{.State.Health.Status}}' ${local.prefix}-rabbitmq 2>/dev/null || echo stopped"
+    interval     = 15
+    timeout      = 5
+  }
+
+  metadata {
+    display_name = "SpiceDB"
+    key          = "5_svc_spicedb"
+    script       = "docker inspect --format='{{.State.Status}}' ${local.prefix}-spicedb 2>/dev/null || echo stopped"
+    interval     = 15
+    timeout      = 5
   }
 }
 
@@ -222,12 +283,12 @@ resource "coder_app" "rabbitmq_mgmt" {
 }
 
 resource "coder_app" "zed" {
-    agent_id = coder_agent.main.id
-    slug          = "slug"
-    display_name  = "Zed"
-    external = true
-    url      = "zed://ssh/coder.${data.coder_workspace.me.name}"
-    icon     = "/icon/zed.svg"
+  agent_id     = coder_agent.main.id
+  slug         = "slug"
+  display_name = "Zed"
+  external     = true
+  url          = "zed://ssh/coder.${data.coder_workspace.me.name}"
+  icon         = "/icon/zed.svg"
 }
 
 
