@@ -2,56 +2,74 @@
 # INFRASTRUCTURE — PostgreSQL · Keycloak · RabbitMQ · SpiceDB
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ─── Préparation des fichiers de configuration ─────────────────────────────────
+# ─── Peuplement des volumes de configuration ──────────────────────────────────
 #
-# Plusieurs containers infra ont besoin de fichiers issus du repo communities :
-#   - PostgreSQL  : compose/init-uuid.sql  (active l'extension pgcrypto)
-#   - Keycloak    : keycloak-config/       (import du realm au démarrage)
-#   - RabbitMQ    : compose/rabbitmq-init.sh (création des exchanges/queues)
+# Les fichiers de config (init-uuid.sql, keycloak-config/, rabbitmq-init.sh)
+# sont copiés depuis le repo communities dans des volumes Docker nommés.
+# Contrairement aux bind-mounts depuis /tmp, les volumes Docker sont persistants
+# et ne risquent pas d'être vidés par l'OS entre deux démarrages du workspace.
 #
-# Ce null_resource clone le repo communities sur le host Coder une seule fois.
-# Il utilise `always_run = timestamp()` pour s'assurer que le clone existe
-# même si /tmp a été vidé entre deux démarrages du workspace. Le script est
-# idempotent : il ne reclone que si le répertoire est absent.
-#
-# Prérequis : `git` doit être disponible sur le host Coder.
-# (C'est garanti sur tout serveur Linux standard.)
+# Le null_resource clone le repo si nécessaire, puis copie les fichiers dans
+# les volumes via `docker run alpine`. Idempotent : toujours_run force le
+# re-check à chaque apply, mais le script ne reclone que si le répertoire
+# est absent.
 # ─────────────────────────────────────────────────────────────────────────────
 
-resource "null_resource" "prepare_infra_files" {
+resource "docker_volume" "postgres_init" {
+  name = "${local.prefix}-postgres-init"
+  lifecycle { ignore_changes = all }
+}
+
+resource "docker_volume" "keycloak_config" {
+  name = "${local.prefix}-keycloak-config"
+  lifecycle { ignore_changes = all }
+}
+
+resource "docker_volume" "infra_scripts" {
+  name = "${local.prefix}-infra-scripts"
+  lifecycle { ignore_changes = all }
+}
+
+resource "null_resource" "populate_config_volumes" {
   triggers = {
-    # Force le re-check à chaque apply pour garantir que les fichiers existent.
-    # Le script est idempotent donc si le répertoire est déjà là, c'est un no-op.
-    always_run   = timestamp()
-    workspace_id = local.workspace_id
-    git_ref      = local.communities_git_ref
+    always_run = timestamp()
+    git_ref    = local.communities_git_ref
   }
 
   provisioner "local-exec" {
     command = <<-EOT
       set -e
-      REPO_PATH="${local.repo_path}"
+      REPO="${local.repo_path}"
 
-      # Re-clone si absent (ex: /tmp nettoyé par l'OS entre deux démarrages)
-      if [ ! -d "$REPO_PATH" ] || [ ! -f "$REPO_PATH/Dockerfile" ]; then
+      if [ ! -d "$REPO" ] || [ ! -f "$REPO/Dockerfile" ]; then
         echo "Cloning communities @ ${local.communities_git_ref}..."
-        rm -rf "$REPO_PATH"
-        mkdir -p "$(dirname $REPO_PATH)"
+        rm -rf "$REPO"
+        mkdir -p "$(dirname $REPO)"
         git clone --depth 1 \
           --branch "${local.communities_git_ref}" \
           https://github.com/beep-industries/communities.git \
-          "$REPO_PATH"
-        echo "✅ Clone terminé"
+          "$REPO"
+        echo "Clone terminé"
       else
-        echo "ℹ️  Repo déjà présent, skip clone"
+        echo "Repo déjà présent, skip clone"
       fi
+
+      docker run --rm \
+        -v "${local.prefix}-postgres-init:/pg-init" \
+        -v "${local.prefix}-keycloak-config:/kc-config" \
+        -v "${local.prefix}-infra-scripts:/scripts" \
+        -v "$REPO:/src:ro" \
+        alpine sh -c "
+          cp /src/compose/init-uuid.sql /pg-init/
+          cp -r /src/keycloak-config/. /kc-config/
+          cp /src/compose/rabbitmq-init.sh /scripts/
+          chmod +x /scripts/rabbitmq-init.sh
+        "
     EOT
   }
 }
 
 # ─── Volumes persistants ───────────────────────────────────────────────────────
-# ignore_changes = all : protège les volumes contre la suppression si les
-# attributs changent. Les données sont préservées entre start/stop du workspace.
 
 resource "docker_volume" "communities_db" {
   name = "${local.prefix}-communities-db"
@@ -74,14 +92,14 @@ resource "docker_volume" "rabbitmq_data" {
 
 resource "docker_image" "postgres" {
   name         = "postgres:17"
-  keep_locally = true # Évite de re-télécharger à chaque workspace
+  keep_locally = true
 }
 
 resource "docker_container" "communities_db" {
   count    = data.coder_workspace.me.start_count
   image    = docker_image.postgres.image_id
   name     = "${local.prefix}-communities-db"
-  hostname = "communities-db" # Hostname DNS utilisé par les autres containers
+  hostname = "communities-db"
   restart  = "unless-stopped"
 
   env = [
@@ -90,18 +108,15 @@ resource "docker_container" "communities_db" {
     "POSTGRES_PASSWORD=communities",
   ]
 
-  # Données persistantes — survit au stop/start du workspace
   volumes {
     volume_name    = docker_volume.communities_db.name
     container_path = "/var/lib/postgresql/data"
   }
 
-  # Script d'init executé par Postgres uniquement à la première initialisation
-  # de la DB. Active l'extension pgcrypto nécessaire pour les UUIDs.
+  # init-uuid.sql active pgcrypto — Postgres ne l'exécute qu'à la première init de la DB.
   volumes {
-    host_path      = "${local.repo_path}/compose/init-uuid.sql"
-    container_path = "/docker-entrypoint-initdb.d/01-init-uuid.sql"
-    read_only      = true
+    volume_name    = docker_volume.postgres_init.name
+    container_path = "/docker-entrypoint-initdb.d"
   }
 
   healthcheck {
@@ -116,15 +131,11 @@ resource "docker_container" "communities_db" {
     name = docker_network.workspace.name
   }
 
-  depends_on = [null_resource.prepare_infra_files]
+  depends_on = [null_resource.populate_config_volumes]
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Keycloak — Identity & Access Management
-#
-# Communities valide les JWTs via Keycloak (OIDC) ET via JWT_SECRET_KEY.
-# Le realm "myrealm" est importé depuis keycloak-config/ au démarrage de
-# Keycloak grâce à la commande `start --import-realm`.
 # ─────────────────────────────────────────────────────────────────────────────
 
 resource "docker_image" "postgres_keycloak" {
@@ -175,8 +186,6 @@ resource "docker_container" "keycloak" {
   hostname = "keycloak"
   restart  = "unless-stopped"
 
-  # --import-realm : Keycloak importe les fichiers JSON du volume au démarrage.
-  # Si le realm existe déjà en DB, l'import est ignoré (idempotent).
   command = ["start", "--import-realm"]
 
   env = [
@@ -184,30 +193,28 @@ resource "docker_container" "keycloak" {
     "KC_HTTP_ENABLED=true",
     "KC_HOSTNAME_STRICT_HTTPS=false",
     "KC_HEALTH_ENABLED=true",
-    # Connexion à la DB Keycloak
     "KC_DB=postgres",
     "KC_DB_URL=jdbc:postgresql://keycloak-db/keycloak",
     "KC_DB_USERNAME=keycloak",
     "KC_DB_PASSWORD=keycloak",
-    # Admin par défaut
     "KEYCLOAK_ADMIN=admin",
     "KEYCLOAK_ADMIN_PASSWORD=admin",
   ]
 
-  # Fichiers du realm importés depuis le repo communities cloné
+  # Realm importé depuis le volume persistant (plus de bind-mount /tmp)
   volumes {
-    host_path      = "${local.repo_path}/keycloak-config"
+    volume_name    = docker_volume.keycloak_config.name
     container_path = "/opt/keycloak/data/import"
-    read_only      = true
   }
 
   healthcheck {
-    # Keycloak 26.x expose un endpoint de santé sur le port management (9000)
-    test         = ["CMD-SHELL", "curl -sf http://localhost:9000/health/ready || exit 1"]
+    # L'image Keycloak (UBI minimal) ne contient pas curl — on utilise bash TCP
+    # pour tester le port management (9000) exposé depuis Keycloak 25+.
+    test         = ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && printf 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q 'status.*UP' <&3 || exit 1"]
     interval     = "15s"
     timeout      = "10s"
     retries      = 10
-    start_period = "60s" # Keycloak est lent à démarrer
+    start_period = "60s"
   }
 
   networks_advanced {
@@ -216,15 +223,12 @@ resource "docker_container" "keycloak" {
 
   depends_on = [
     docker_container.keycloak_db,
-    null_resource.prepare_infra_files,
+    null_resource.populate_config_volumes,
   ]
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RabbitMQ — Message Broker
-#
-# Communities publie des events (outbox pattern) via RabbitMQ.
-# Le script rabbitmq-init.sh crée les exchanges et queues nécessaires.
 # ─────────────────────────────────────────────────────────────────────────────
 
 resource "docker_image" "rabbitmq" {
@@ -266,17 +270,10 @@ resource "docker_container" "rabbitmq" {
   }
 }
 
-# Initialise les exchanges et queues dans RabbitMQ via le script du repo.
-# Lance un container temporaire sur le réseau du workspace qui :
-#   1. Attend que RabbitMQ soit prêt via son API management (avec retry)
-#   2. Exécute le script d'init (rabbitmqadmin ou API HTTP)
 resource "null_resource" "rabbitmq_init" {
   count = data.coder_workspace.me.start_count
 
   triggers = {
-    # always_run garantit l'exécution à chaque démarrage du workspace.
-    # On n'utilise pas docker_container.rabbitmq[0].name car ce container
-    # n'existe pas quand start_count = 0 (workspace arrêté).
     always_run   = timestamp()
     workspace_id = local.workspace_id
   }
@@ -285,7 +282,7 @@ resource "null_resource" "rabbitmq_init" {
     command = <<-EOT
       docker run --rm \
         --network "${docker_network.workspace.name}" \
-        --volume "${local.repo_path}/compose/rabbitmq-init.sh:/rabbitmq-init.sh:ro" \
+        -v "${local.prefix}-infra-scripts:/scripts:ro" \
         --env RABBITMQ_HOST=rabbitmq \
         --env RABBITMQ_USER=guest \
         --env RABBITMQ_PASS=guest \
@@ -298,23 +295,19 @@ resource "null_resource" "rabbitmq_init" {
             sleep 5
           done
           echo 'RabbitMQ prêt, lancement du script d init...'
-          bash /rabbitmq-init.sh
+          bash /scripts/rabbitmq-init.sh
         "
     EOT
   }
 
   depends_on = [
     docker_container.rabbitmq,
-    null_resource.prepare_infra_files,
+    null_resource.populate_config_volumes,
   ]
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SpiceDB — Fine-grained Authorization (ReBAC)
-#
-# Communities appelle SpiceDB pour vérifier les permissions (SPICEDB_ENDPOINT).
-# En mode dev, on utilise le datastore en mémoire : pas de persistance,
-# démarrage instantané, aucune dépendance externe.
 # ─────────────────────────────────────────────────────────────────────────────
 
 resource "docker_image" "spicedb" {
@@ -331,8 +324,8 @@ resource "docker_container" "spicedb" {
 
   command = [
     "serve",
-    "--grpc-preshared-key=foobar",   # Token attendu par communities (SPICEDB_TOKEN)
-    "--datastore-engine=memory",     # Dev uniquement — pas de persistance
+    "--grpc-preshared-key=foobar",
+    "--datastore-engine=memory",
     "--http-enabled=true",
   ]
 
